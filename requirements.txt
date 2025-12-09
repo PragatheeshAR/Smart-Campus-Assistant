@@ -1,0 +1,12 @@
+streamlit==1.27.1
+pdfplumber
+python-docx
+python-pptx
+nltk
+sentence-transformers
+faiss-cpu
+openai
+transformers
+torch
+tqdm
+datasets

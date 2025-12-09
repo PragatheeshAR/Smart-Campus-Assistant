@@ -1,0 +1,19 @@
+# Python environment files
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints
+
+# Streamlit/PDF temporary files
+*.tmp
+smartstudy_*
+.streamlit/
+/local/
+
+# Large model and data files (especially those downloaded by Hugging Face)
+# This prevents checking in gigabytes of model weights
+/models/
+/data/
+/embeddings/
+.DS_Store
