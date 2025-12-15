@@ -4,6 +4,8 @@ import tempfile
 import traceback
 import streamlit as st
 import shutil
+import re 
+from typing import List, Dict, Any
 
 # --- LOGIC IMPORTS ---
 
@@ -31,12 +33,13 @@ except Exception:
 # 4. Study Assistant (RAG logic)
 try:
     from study_assistant import StudyAssistant
-    HAS_ASSISTANT = TEXT_UTILITY_AVAILABLE and True # Assistant requires extracted text
-except Exception:
+    HAS_ASSISTANT = TEXT_UTILITY_AVAILABLE and True 
+except Exception as e:
     HAS_ASSISTANT = False
+    print(f"Study Assistant loading error: {e}")
 
 
-st.set_page_config(page_title="Smart Study Summarizer", layout="centered")
+st.set_page_config(page_title="AI Study Assistant & Knowledge Builder", layout="centered")
 
 # --- UI COMPONENTS & HELPERS ---
 
@@ -52,86 +55,154 @@ def save_uploaded_temp(uploaded) -> (str, str):
 def render_quick_points(points):
     """Render list of strings as a short revision summary."""
     if not points:
-        st.warning("⚠️ No quick points were returned by the summarizer.")
+        st.warning("⚠️ No core revision points were generated.")
         return
 
-    st.subheader("⚡ Quick Revision Summary (llmware)")
+    st.subheader("⚡ Core Revision Points")
     for i, p in enumerate(points, start=1):
         clean = p.replace("\n", " ").strip()
-        import re
         clean = re.sub(r"<[^>]+>", "", clean)
         st.markdown(f"**{i}.** {clean}")
 
 def render_detailed(doc_text):
     """Call and render detailed summary."""
     if not HAS_DETAILED:
-        st.error("Detailed summarizer not found.")
+        st.error("Detailed structured analysis module not found.")
         return
-    with st.spinner("🧠 Generating detailed summary..."):
+    with st.spinner("🧠 Generating detailed analysis..."):
         try:
-            # summarize_document takes the extracted text
             detailed = summarize_document(doc_text)
-            st.subheader("📚 Detailed Study Summary (BART-CNN)")
-            st.text_area("Detailed summary", value=detailed, height=400)
+            st.subheader("📚 Comprehensive Document Analysis")
+            st.text_area("Detailed analysis", value=detailed, height=400)
         except Exception as e:
-            st.error(f"Failed to generate detailed summary: {e}")
+            st.error(f"Failed to generate detailed analysis: {e}")
             st.exception(traceback.format_exc())
 
+
 def render_assistant_ui(text_content):
-    """UI for Q&A and MCQ generation using the StudyAssistant class."""
+    """UI for Dual-Mode Q&A and MCQ generation using StudyAssistant."""
     if not HAS_ASSISTANT:
-        st.warning("Study Assistant not available.")
+        st.warning("Interactive Knowledge Assistant not available.")
         return
 
     st.markdown("---")
-    st.header("Ask Your Document (RAG Assistant) 🤖")
+    st.header("Interactive Knowledge Assistant 🤖")
     
-    # Cache the assistant object itself
     @st.cache_resource
     def load_assistant(text):
-        with st.spinner("Indexing document for Q&A..."):
+        with st.spinner("Indexing document for knowledge retrieval..."):
             return StudyAssistant(text)
 
     assistant = load_assistant(text_content)
     
-    # Q&A Section
-    st.subheader("❓ Question & Answer")
-    q = st.text_input("Ask a specific question about the document:", key="qa_query")
-    if st.button("Get Answer"):
+    # --- DUAL MODE Q&A SECTION ---
+    st.subheader("❓ Ask Questions - Dual Mode")
+    
+    qa_mode = st.radio(
+        "Select Answer Mode:",
+        options=["📄 Grounded (Document Only)", "🌐 Web-Enhanced (Search Online)"],
+        horizontal=True
+    )
+    
+    q = st.text_input("Ask a question:", key="qa_query")
+    
+    if st.button("Get Answer", type="primary"):
         if q:
-            with st.spinner("Searching and generating answer..."):
-                answer = assistant.answer_question(q)
-                st.info(f"**Answer:** {answer}")
+            if "Grounded" in qa_mode:
+                with st.spinner("🔍 Searching document..."):
+                    answer = assistant.answer_question_grounded(q)
+                    st.markdown(answer)
+            else:
+                with st.spinner("🌐 Searching online..."):
+                    answer = assistant.answer_question_web(q)
+                    st.markdown(answer)
         else:
             st.warning("Please enter a question.")
 
-    # MCQ Generation Section
-    st.subheader("📝 Generate Practice MCQs")
-    num_mcq = st.slider("Number of MCQs to generate:", min_value=1, max_value=5, value=3)
-    mcq_topic = st.text_input("Focus MCQs on a topic (optional):", key="mcq_topic")
+    # --- MCQ GENERATION SECTION ---
+    st.markdown("---")
+    st.subheader("📝 Practice Quiz Generator")
+
+    # 🔥 NEW MCQ MODE DROPDOWN ADDED
+    mcq_mode = st.selectbox(
+        "Select MCQ Generation Mode:",
+        ["PDF Only", "Hybrid (PDF + Web)", "Web Only"]
+    )
     
-    if st.button("Generate MCQs"):
-        with st.spinner("Generating practice questions..."):
-            mcqs = assistant.generate_mcqs(mcq_topic, num_mcq)
-            st.text_area("Generated Multiple Choice Questions", value=mcqs, height=400)
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        mcq_topic = st.text_input("Optional Topic Filter:", key="mcq_topic")
+    with col2:
+        num_mcq = st.slider("Number of MCQs:", min_value=1, max_value=5, value=3)
+
+    if st.button("Generate Quiz", type="secondary"):
+        with st.spinner("🎯 Generating quiz questions..."):
+            quizzes = assistant.generate_mcqs(
+                topic=mcq_topic,
+                num_questions=num_mcq,
+                mode=mcq_mode   # <-- 🔥 NEW ARGUMENT
+            )
+            
+            if isinstance(quizzes, str):
+                st.error(quizzes)
+                st.session_state.quiz_data = None
+            elif quizzes:
+                st.session_state.quiz_data = quizzes
+                st.session_state.shown_answer = {}
+                st.success(f"Generated {len(quizzes)} MCQs!")
+            else:
+                st.error("Quiz generation returned no questions.")
+
+    # --- MCQ DISPLAY ---
+    if "quiz_data" in st.session_state and st.session_state.quiz_data:
+        st.markdown("---")
+        st.markdown("### 🎯 Test Your Knowledge")
+
+        if "shown_answer" not in st.session_state:
+            st.session_state.shown_answer = {}
+
+        for i, q_item in enumerate(st.session_state.quiz_data, 1):
+            st.markdown(f"#### Question {i}")
+            st.markdown(f"**{q_item['question']}**")
+            st.markdown("\n".join(q_item["options"]))
+
+            button_key = f"show_{i}"
+            answer_key = f"ans_{i}"
+
+            if st.button("Show Answer", key=button_key):
+                st.session_state.shown_answer[answer_key] = not st.session_state.shown_answer.get(answer_key, False)
+                st.rerun()
+
+            if st.session_state.shown_answer.get(answer_key, False):
+                st.success(f"Correct Answer: {q_item['correct_answer']}")
+
+        if st.button("Clear Quiz"):
+            del st.session_state.quiz_data
+            st.session_state.shown_answer = {}
+            st.rerun()
 
 
-# --- MAIN UI LOGIC ---
+# --- MAIN EXECUTION ---
 
-st.title("📘 Smart Study Summarizer (llmware + Hugging Face RAG)")
-st.write("Upload a PDF to generate summaries and enable the Q&A assistant.")
-
-uploaded_file = st.file_uploader("📄 Upload PDF", type=["pdf"])
+st.title("📘 AI Study Assistant & Knowledge Builder")
+uploaded_file = st.file_uploader("📄 Upload Document", type=["pdf"])
 
 if uploaded_file:
     
-    # --- Configuration ---
-    summary_type = st.selectbox("📝 Choose summary type", ["Quick Summary (llmware)", "Detailed Summary (existing)", "Both"])
-    max_batches = st.slider("Max batches (llmware)", min_value=3, max_value=40, value=15, help="Higher -> cover more of the document (slower).")
+    summary_type = st.selectbox("Select Output Mode", [
+        "Concise Revision Points", 
+        "Detailed Structured Analysis", 
+        "Both"
+    ])
+    
+    max_batches = st.slider("Max Batches (Quick Summary)", 3, 40, 15)
 
-    # --- File Management (using session_state for persistence) ---
+    # FILE HANDLING
     if "tmpdir" not in st.session_state or st.session_state.fname != uploaded_file.name:
         try:
+            if "tmpdir" in st.session_state and os.path.exists(st.session_state.tmpdir):
+                shutil.rmtree(st.session_state.tmpdir)
+
             tmpdir, fname = save_uploaded_temp(uploaded_file)
             st.session_state.tmpdir = tmpdir
             st.session_state.fname = fname
@@ -141,62 +212,28 @@ if uploaded_file:
     else:
         tmpdir = st.session_state.tmpdir
         fname = st.session_state.fname
-
-    full_file_path = os.path.join(tmpdir, fname)
     
-    # CHECK: Ensure text extraction utility is available before proceeding
-    if not TEXT_UTILITY_AVAILABLE:
-        st.error("Text extraction utility not found. Please ensure summarizer.py is present and correct.")
-        st.stop()
+    full_path = os.path.join(tmpdir, fname)
 
-
-    @st.cache_data
-    def get_document_text(path):
+    @st.cache_data(ttl=3600)
+    def get_doc_text(path):
         return extract_text_from_pdf(path)
-        
-    doc_text = get_document_text(full_file_path)
 
-    # --- Action Button ---
-    if st.button("✨ Summarize and Index Document"):
-        
-        # 1. Quick Summary (llmware)
-        if summary_type in ["Quick Summary (llmware)", "Both"]:
+    doc_text = get_doc_text(full_path)
+
+    # PROCESS DOCUMENT
+    if st.button("✨ Process Document", type="primary"):
+        if summary_type in ["Concise Revision Points", "Both"]:
             if HAS_QUICK:
-                try:
-                    with st.spinner("🔎 Running quick summarizer (llmware)..."):
-                        quick_points = quick_summarize_file(tmpdir, fname, max_batch_cap=max_batches)
-                        render_quick_points(quick_points)
-                except Exception as e:
-                    st.error("❌ Quick summarizer failed.")
-                    st.exception(traceback.format_exc())
-            else:
-                st.warning("Quick summarizer utility not available.")
+                with st.spinner("Generating quick summary..."):
+                    quick = quick_summarize_file(tmpdir, fname, max_batch_cap=max_batches)
+                    render_quick_points(quick)
 
-        # 2. Detailed Summary (BART-CNN)
-        if summary_type in ["Detailed Summary (existing)", "Both"]:
-            if HAS_DETAILED and doc_text:
-                render_detailed(doc_text)
-            elif HAS_DETAILED:
-                 st.error("Could not extract text for Detailed Summarizer.")
-            else:
-                st.warning("Detailed summarizer utility not available.")
+        if summary_type in ["Detailed Structured Analysis", "Both"]:
+            render_detailed(doc_text)
 
-    # 3. Interactive Assistant UI (Always render if possible after file upload)
     if doc_text and HAS_ASSISTANT:
         render_assistant_ui(doc_text)
-    elif uploaded_file and not HAS_ASSISTANT:
-        st.warning("Study Assistant not available. Please ensure study_assistant.py is present and dependencies are installed.")
-        
 
 else:
-    # Cleanup temp directory when file is deselected/app is reloaded
-    if "tmpdir" in st.session_state:
-        try:
-            shutil.rmtree(st.session_state.tmpdir)
-        except:
-            pass
-        for key in ["tmpdir", "fname", "assistant_text_content"]:
-            if key in st.session_state:
-                del st.session_state[key]
-        
-    st.info("📄 Upload a PDF to get started.")
+    st.info("Upload a PDF to begin.")

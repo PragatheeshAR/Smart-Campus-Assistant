@@ -47,7 +47,7 @@ def load_summarizer():
 
 
 # -------------------------
-# PDF text extraction
+# PDF text extraction (Original PyPDF2 logic)
 # -------------------------
 def extract_text_from_pdf(uploaded_file) -> str:
     if hasattr(uploaded_file, "read"):

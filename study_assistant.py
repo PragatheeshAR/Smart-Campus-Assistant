@@ -6,180 +6,163 @@ import faiss
 import numpy as np
 import re
 import spacy
-import streamlit as st # Imported for cache_resource
+import streamlit as st
+from typing import List, Dict
+import requests
+from bs4 import BeautifulSoup
+import random
 
-# --- Model Loading (Cached) ---
+# =========================
+# LOAD MODELS
+# =========================
 
-# Load spaCy for robust sentence/paragraph splitting
 try:
-    # Attempt to load small model
     nlp = spacy.load("en_core_web_sm")
-except Exception:
-    # Fallback if model not downloaded
+except:
     from spacy.lang.en import English
     nlp = English()
-    # It's recommended to run 'python -m spacy download en_core_web_sm' first
-
-# 1. Retrieval Model (Embedding)
-# Used for converting text chunks and questions into vectors
-@st.cache_resource(show_spinner=False)
-def load_embedder_model():
-    # Model specified in requirements.txt (sentence-transformers)
-    return SentenceTransformer('all-MiniLM-L6-v2') 
-
-# 2. Generation Model (Q&A and MCQ generation)
-# Flan-T5 is excellent for Instruction Tuning tasks
-QA_MODEL = "google/flan-t5-base" 
 
 @st.cache_resource(show_spinner=False)
-def load_qa_model():
-    tokenizer = AutoTokenizer.from_pretrained(QA_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(QA_MODEL)
-    return tokenizer, model
+def load_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-# Load models outside the class (using Streamlit cache)
-embedder = load_embedder_model()
-qa_tokenizer, qa_model = load_qa_model()
+QA_MODEL = "google/flan-t5-base"
 
-# --- Helper Functions (Chunking) ---
+@st.cache_resource(show_spinner=False)
+def load_qa():
+    tok = AutoTokenizer.from_pretrained(QA_MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(QA_MODEL).to("cpu")
+    return tok, model
 
-def _chunk_text_spacy(text: str):
-    """Splits text into chunks, prioritizing paragraph boundaries for RAG."""
+QG_MODEL = "mrm8488/t5-base-finetuned-question-generation-ap"
+
+@st.cache_resource(show_spinner=False)
+def load_qg():
+    tok = AutoTokenizer.from_pretrained(QG_MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(QG_MODEL).to("cpu")
+    return tok, model
+
+embedder = load_embedder()
+qa_tok, qa_model = load_qa()
+qg_tok, qg_model = load_qg()
+
+# =========================
+# HELPERS
+# =========================
+
+def chunk_text(text, size=600):
     doc = nlp(text)
-    
-    # Try to split by meaningful paragraphs first
-    # FIX: Corrected from p.text.strip() to p.strip() as p is already a string
-    paragraphs = [p.strip() for p in doc.text.split("\n\n") if p.strip()]
-
-    chunks = []
-    current_chunk = ""
-    max_chunk_len = 1500 # Max characters for a RAG chunk
-
-    for p in paragraphs:
-        if len(p) > max_chunk_len:
-            # If paragraph is too long, split into sentences
-            sents = [s.text.strip() for s in nlp(p).sents if s.text.strip()]
-            for s in sents:
-                 if len(current_chunk) + len(s) + 10 < max_chunk_len:
-                    current_chunk += " " + s
-                 else:
-                    if current_chunk: chunks.append(current_chunk.strip())
-                    current_chunk = s
+    sents = [s.text.strip() for s in doc.sents if len(s.text.strip()) > 30]
+    chunks, cur = [], ""
+    for s in sents:
+        if len(cur) + len(s) < size:
+            cur += " " + s
         else:
-            # Add paragraph if it fits or start a new chunk with it
-            if len(current_chunk) + len(p) + 10 < max_chunk_len:
-                current_chunk += "\n\n" + p
-            else:
-                if current_chunk: chunks.append(current_chunk.strip())
-                current_chunk = p
-    
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-    
-    # Filter out very short or empty chunks
-    return [c for c in chunks if len(c) > 50] 
+            chunks.append(cur.strip())
+            cur = s
+    if cur:
+        chunks.append(cur.strip())
+    return chunks
 
+def web_search(query):
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={query.replace(' ','+')}"
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
+        soup = BeautifulSoup(r.text, "html.parser")
+        results = [d.get_text(" ", strip=True) for d in soup.select(".result__body")[:5]]
+        return "\n".join(results)
+    except:
+        return ""
 
-# --- Main Class (StudyAssistant) ---
+def generate_question(context):
+    prompt = f"generate question: {context}"
+    inp = qg_tok(prompt, return_tensors="pt", truncation=True, max_length=512)
+    out = qg_model.generate(**inp, max_new_tokens=64)
+    return qg_tok.decode(out[0], skip_special_tokens=True)
+
+def extract_answer(context, question):
+    prompt = f"""
+Context:
+{context}
+
+Question:
+{question}
+
+Answer using only the context.
+"""
+    inp = qa_tok(prompt, return_tensors="pt", truncation=True, max_length=512)
+    out = qa_model.generate(**inp, max_new_tokens=64)
+    return qa_tok.decode(out[0], skip_special_tokens=True)
+
+# =========================
+# STUDY ASSISTANT
+# =========================
+
 class StudyAssistant:
     def __init__(self, full_text):
-        self.chunks = _chunk_text_spacy(full_text)
-        self.index = self._build_faiss_index()
+        self.text = full_text
+        self.chunks = chunk_text(full_text)
+        self.index = self.build_index()
 
-    def _build_faiss_index(self):
-        """Creates the FAISS vector index."""
+    def build_index(self):
         if not self.chunks:
             return None
-            
-        embeddings = embedder.encode(self.chunks)
-        d = embeddings.shape[1] 
-        # IndexFlatL2 for fast Euclidean distance similarity search
-        index = faiss.IndexFlatL2(d) 
-        # FAISS requires float32 numpy array
-        index.add(np.array(embeddings).astype('float32'))
-        return index
+        emb = embedder.encode(self.chunks)
+        idx = faiss.IndexFlatL2(emb.shape[1])
+        idx.add(np.array(emb).astype("float32"))
+        return idx
 
-    def _retrieve_context(self, question, k=4):
-        """Retrieves the top k chunks relevant to the question."""
+    def retrieve(self, query, k=4):
         if not self.index:
-            return "No document text indexed."
-            
-        # 1. Embed the query
-        query_embedding = embedder.encode([question])
-        # 2. Search the index
-        D, I = self.index.search(np.array(query_embedding).astype('float32'), k)
-        
-        # 3. Get the chunks based on the indices I
-        context = [self.chunks[i] for i in I[0] if i < len(self.chunks)] 
-        return "\n\n---\n\n".join(context)
+            return self.text
+        q_emb = embedder.encode([query])
+        _, I = self.index.search(np.array(q_emb).astype("float32"), k)
+        return "\n".join([self.chunks[i] for i in I[0] if i < len(self.chunks)])
 
-    def _generate(self, prompt, max_new_tokens=150):
-        """Handles the generation call to Flan-T5."""
-        inputs = qa_tokenizer(
-            prompt, 
-            return_tensors="pt", 
-            max_length=512, # Max context length for Flan-T5-base
-            truncation=True
-        )
-        
-        # Determine device for generation
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        input_ids = inputs.input_ids.to(device)
-        attention_mask = inputs.attention_mask.to(device)
+    # -------------------------
+    # Q&A
+    # -------------------------
 
-        output = qa_model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            num_beams=4,
-            do_sample=False
-        )
-        return qa_tokenizer.decode(output[0], skip_special_tokens=True)
+    def answer_question_grounded(self, q):
+        ctx = self.retrieve(q)
+        return extract_answer(ctx, q)
 
+    def answer_question_web(self, q):
+        ctx = web_search(q)
+        return extract_answer(ctx, q)
 
-    def answer_question(self, question):
-        """RAG Q&A implementation."""
-        context = self._retrieve_context(question, k=4)
-        
-        if len(context) < 100:
-             return "I could not find enough relevant information in the document to answer that question."
+    # -------------------------
+    # MCQ (QUESTION + ANSWER ONLY)
+    # -------------------------
 
-        # Prompt forces the model to use ONLY the context
-        prompt = f"""
-        Context: {context}
-        
-        Using ONLY the context provided, answer the following question concisely and accurately. If the answer is not in the context, state that you cannot answer it based on the provided text.
-        
-        Question: {question}
-        
-        Answer:"""
-        
-        return self._generate(prompt, max_new_tokens=100)
+    def generate_mcqs(self, topic, num_questions, mode):
+        topic = topic or "key concepts"
+        context = self.retrieve(topic)
 
-    def generate_mcqs(self, topic: str = None, num_questions: int = 3):
-        """Generates multiple choice questions."""
-        
-        # Retrieval query targets concepts relevant to testing
-        retrieval_query = f"Key concepts and facts for a test on {topic}" if topic else "Key concepts and facts of the document for a practice test"
-        context = self._retrieve_context(retrieval_query, k=5)
-        
-        if len(context) < 200:
-            return "Could not retrieve enough document content to reliably generate MCQs."
+        if mode == "Web Only":
+            context = web_search(topic)
 
-        # Structured prompt for reliable MCQ output
-        mcq_prompt = f"""
-        Context: {context}
-        
-        Generate exactly {num_questions} multiple choice questions (MCQs) with 4 options (A, B, C, D) and clearly state the correct answer at the end of each question. Use ONLY information from the context.
-        
-        Example Format:
-        1. What is the main characteristic of a T-cell?
-        A) Produces antibodies
-        B) Directly attacks infected cells (Correct Answer)
-        C) Phagocytizes bacteria
-        D) Releases histamine
+        questions = []
+        used = set()
 
-        Begin the MCQs:"""
-        
-        # Allow more tokens for structured, longer MCQ response
-        return self._generate(mcq_prompt, max_new_tokens=70 * num_questions)
+        for chunk in self.chunks:
+            if len(questions) >= num_questions:
+                break
+
+            q = generate_question(chunk)
+            if not q or q in used:
+                continue
+            used.add(q)
+
+            ans = extract_answer(chunk, q)
+            if not ans or len(ans) < 3:
+                continue
+
+            # 🔥 OPTIONS REMOVED COMPLETELY
+            questions.append({
+                "question": q,
+                "options": [],            # <-- NOTHING SHOWN
+                "correct_answer": ans     # <-- SHOWN ONLY ON CLICK
+            })
+
+        return questions if questions else "MCQ generation failed."
